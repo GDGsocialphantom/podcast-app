@@ -1,0 +1,126 @@
+#!/usr/bin/env node
+// Validates data/shows.js, data/episodes.js and data/transcripts/*.json before they hit the site.
+// Run: node tools/check-data.js   (exit code 1 on any problem)
+const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
+
+const root = path.join(__dirname, "..");
+const ctx = vm.createContext({});
+let src = "";
+for (const f of ["data/shows.js", "data/episodes.js"]) {
+  const code = fs.readFileSync(path.join(root, f), "utf8");
+  try {
+    new vm.Script(code, { filename: f }); // syntax check with a useful file:line
+  } catch (e) {
+    console.error(`${f}: does not parse. ${e.message}\n${e.stack.split("\n").slice(0, 3).join("\n")}`);
+    process.exit(1);
+  }
+  src += code + "\n";
+}
+const { SHOWS, EPISODES } = vm.runInContext(src + "\n;({ SHOWS: typeof SHOWS === 'undefined' ? undefined : SHOWS, EPISODES: typeof EPISODES === 'undefined' ? undefined : EPISODES })", ctx);
+const problems = [];
+const bad = (id, msg) => problems.push(`${id}: ${msg}`);
+
+if (!Array.isArray(SHOWS) || !SHOWS.length) bad("shows", "SHOWS is missing or empty");
+if (!Array.isArray(EPISODES)) bad("episodes", "EPISODES is not an array");
+
+const showIds = new Set();
+for (const s of SHOWS || []) {
+  const id = s.id || "(no id)";
+  if (!s.id) bad("shows", "a show has no id");
+  if (showIds.has(s.id)) bad(id, "duplicate show id");
+  showIds.add(s.id);
+  for (const k of ["name", "color", "org", "tagline", "about"]) if (!s[k]) bad(id, `show missing ${k}`);
+  if (s.color && !/^#[0-9a-fA-F]{6}$/.test(s.color)) bad(id, "color should be a 6-digit hex like #1F2937");
+  if (s.ink && !/^#[0-9a-fA-F]{6}$/.test(s.ink)) bad(id, "ink should be a 6-digit hex");
+  if (s.logo && !/^assets\/shows\/[a-z0-9-]+\.(png|svg|jpg|webp)$/.test(s.logo)) bad(id, "logo should be a file under assets/shows/");
+  if (!Array.isArray(s.hosts) || !s.hosts.length) bad(id, "show has no hosts");
+}
+
+// Episodes whose people line carries a "// TODO full name" comment: a first-name-only guest is known and waiting on records.
+const episodesSrc = fs.readFileSync(path.join(root, "data/episodes.js"), "utf8");
+const todoIds = new Set();
+for (const block of episodesSrc.split(/\n(?=  \{ id: ")/)) { const m = block.match(/id: "([^"]+)"/); if (m && /\/\/\s*TODO full name/.test(block)) todoIds.add(m[1]); }
+
+const epIds = new Set();
+const SAMPLE_YT = "dQw4w9WgXcQ";
+for (const e of EPISODES || []) {
+  const id = e.id || "(no id)";
+  if (!e.id) bad("episodes", "an episode has no id");
+  if (epIds.has(e.id)) bad(id, "duplicate episode id");
+  epIds.add(e.id);
+  if (e.id && /^(home|find|shows|login)$/.test(e.id)) bad(id, "id collides with a route name");
+  if (e.id && e.id.startsWith("show-")) bad(id, "ids starting with show- collide with show pages");
+  if (e.id && e.id.startsWith("admin-")) bad(id, "ids starting with admin- collide with admin pages");
+  if (!showIds.has(e.show)) bad(id, `show "${e.show}" does not exist in shows.js`);
+  for (const k of ["title", "summary", "format", "date"]) if (!e[k]) bad(id, `missing ${k}`);
+  if (e.date && !/^\d{4}-\d{2}-\d{2}$/.test(e.date)) bad(id, `date "${e.date}" should be YYYY-MM-DD`);
+  if (e.date && isNaN(Date.parse(e.date))) bad(id, `date "${e.date}" is not a real date`);
+  if (typeof e.duration !== "number" || e.duration <= 0) bad(id, "duration should be a number of minutes");
+  if (!Array.isArray(e.topics) || !e.topics.length) bad(id, "no topics");
+  if (!Array.isArray(e.people) || !e.people.length) bad(id, "no people");
+  for (const p of e.people || []) {
+    if (!p.n || !p.r) { bad(id, "each person needs n (name) and r (role)"); continue; }
+    if (!/\s/.test(p.n.trim()) && !todoIds.has(e.id)) console.warn(`warning ${id}: person "${p.n}" has no last name; add it, or mark the people line with // TODO full name`);
+  }
+  if (!e.youtube || !/^[\w-]{11}$/.test(e.youtube)) bad(id, "youtube should be an 11-character video id");
+  if (e.youtube === SAMPLE_YT) console.warn(`warning ${id}: still using the sample YouTube id`);
+  if ("transcript" in e) bad(id, "transcripts no longer live in episodes.js; move it to data/transcripts/" + e.id + ".json");
+  if (e.notes) {
+    if (!Array.isArray(e.notes.takeaways)) bad(id, "notes.takeaways should be an array");
+    if (!Array.isArray(e.notes.chapters)) bad(id, "notes.chapters should be an array");
+    for (const ch of e.notes.chapters || []) if (!Array.isArray(ch) || typeof ch[0] !== "number" || !ch[1]) bad(id, "each chapter is [seconds, title]");
+    for (const l of e.notes.links || []) if (!Array.isArray(l) || !l[0] || !/^https?:\/\//.test(l[1] || "")) bad(id, "each link is [label, url]");
+  }
+}
+
+// data/transcripts/<episode id>.json: one file per episode, an array of cues { t: seconds, s: speaker, x: text }
+const txDir = path.join(root, "data", "transcripts");
+let txCount = 0;
+if (fs.existsSync(txDir)) {
+  for (const f of fs.readdirSync(txDir).filter(f => f.endsWith(".json")).sort()) {
+    const id = f.slice(0, -5), label = "transcripts/" + f;
+    let cues;
+    try { cues = JSON.parse(fs.readFileSync(path.join(txDir, f), "utf8")); } catch (e) { bad(label, "does not parse as JSON: " + e.message); continue; }
+    if (!epIds.has(id)) console.warn(`warning ${label}: no episode with id "${id}"`);
+    if (!Array.isArray(cues)) { bad(label, "should be an array of cues"); continue; }
+    let last = -1;
+    for (const c of cues) {
+      if (!c || typeof c.t !== "number" || typeof c.s !== "string" || typeof c.x !== "string" || !c.s || !c.x) { bad(label, "cues need numeric t (seconds), string s (speaker) and x (text)"); break; }
+      if (c.t < last) { bad(label, `cue at ${c.t}s is out of order`); break; }
+      last = c.t;
+    }
+    txCount++;
+  }
+}
+
+// data/transcript-status.json: written by tools/fetch-transcripts.js
+const statusPath = path.join(root, "data", "transcript-status.json");
+const txFiles = fs.existsSync(txDir) ? fs.readdirSync(txDir).filter(f => f.endsWith(".json")).map(f => f.slice(0, -5)) : [];
+if (fs.existsSync(statusPath)) {
+  let st = null;
+  try { st = JSON.parse(fs.readFileSync(statusPath, "utf8")); } catch (e) { bad("transcript-status.json", "does not parse as JSON: " + e.message); }
+  if (st) {
+    if (typeof st !== "object" || typeof st.episodes !== "object") bad("transcript-status.json", "needs an episodes object");
+    if (st.last_run && isNaN(Date.parse(st.last_run))) bad("transcript-status.json", "last_run is not a date");
+    if (typeof st.credits_used_total !== "number") bad("transcript-status.json", "credits_used_total should be a number");
+    for (const [id, v] of Object.entries(st.episodes || {})) {
+      if (!v || !["ok", "no_captions", "credits_exhausted", "error"].includes(v.status)) bad("transcript-status.json", `${id}: status should be ok, no_captions, credits_exhausted or error`);
+      if (!v || isNaN(Date.parse(v.checked))) bad("transcript-status.json", `${id}: checked should be a date`);
+      if (!v || typeof v.credits_used !== "number") bad("transcript-status.json", `${id}: credits_used should be a number`);
+      if (!epIds.has(id)) console.warn(`warning transcript-status.json: no episode with id "${id}"`);
+      if (v && v.status === "ok" && !txFiles.includes(id)) console.warn(`warning transcript-status.json: ${id} is marked ok but has no transcript file`);
+    }
+    for (const id of txFiles) if (!st.episodes[id]) console.warn(`warning transcripts/${id}.json: no entry in transcript-status.json`);
+  }
+} else if (txFiles.length) {
+  console.warn(`warning: ${txFiles.length} transcript file(s) but no data/transcript-status.json`);
+}
+
+if (problems.length) {
+  console.error(problems.join("\n"));
+  console.error(`\n${problems.length} problem${problems.length === 1 ? "" : "s"} found.`);
+  process.exit(1);
+}
+console.log(`OK: ${SHOWS.length} shows, ${EPISODES.length} episodes, ${txCount} transcripts.`);
